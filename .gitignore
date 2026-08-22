@@ -1,0 +1,8 @@
+﻿# 输出结果（每次运行生成，不入库）
+Output_result/
+# Python 缓存
+__pycache__/
+*.pyc
+# 备份/临时
+*.bak
+*.tmp
