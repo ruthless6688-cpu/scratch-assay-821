@@ -1,29 +1,19 @@
 # -*- coding: utf-8 -*-
-"""真实划痕图：中轴法 vs 扫描线法 对比（双口径：包络版 + 无包络版）
+"""真实划痕图：双口径宽度测量（数据输出版，不画图）
 
-对 Input/ 下每张图同时输出两种口径的结果：
-  [包络版]   41px 椭圆闭运算填平边缘细胞凹陷（类包络掩膜）
-  [无包络版] 仅孔洞填充 + 最大连通域（保留真实边缘形态）
+对 Input/ 下每张图同时计算两种口径的宽度统计：
+  [包络版]   椭圆闭运算填平边缘细胞凹陷（类包络掩膜，kernel 见 ENVELOPE_KERNEL）
+  [无包络版] 仅方向性填充 + 孔洞填充 + 最大连通域（保留真实边缘形态）
 
-输出文件命名（与历史版本一致）：
-  包络版   _real{idx}_mask.png / _real{idx}_mask_ridge.png / _real{idx}_profile.png
-  无包络版 _real{idx}_mask_nofill.png / _real{idx}_mask_nofill_ridge.png / _real{idx}_profile_nofill.png
+输出：每张图一个子文件夹（图片标识_月日_时分），内含 result.txt
+     （掩膜占比、方向、中轴法全段/有效区、扫描线法的宽度统计）
 """
-import sys, io, os, re, logging
+import sys, io, os, re
 from datetime import datetime
 import numpy as np, cv2
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 from pathlib import Path
-from skimage.morphology import medial_axis
 from PIL import Image, ImageDraw, ImageFont
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib import font_manager
-
-# 彻底杜绝 findfont 刷屏：把字体查找的日志级别提到 ERROR（只保留真正错误）
-logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
-logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
 # ---- 路径：以脚本所在目录为锚点，整目录拷贝即可换机器运行 ----
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -31,7 +21,11 @@ IMG_DIR = PROJECT_ROOT / 'Input'            # 单张输入图像放这里
 OUT_DIR = PROJECT_ROOT / 'Output_result'    # 输出结果统一放这里
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---- 中文字体：优先项目自带，其次跨平台候选探测，找不到则警告并回退 ----
+from scratch_width_proto import (centerline_width, order_path, longest_path,
+                                 arc_sample, scanline_width, stats, fmt,
+                                 clean_mask_envelope, clean_mask_minimal)
+
+# ---- 中文字体：优先项目自带，其次跨平台候选探测（用于 PIL 叠加图标注）----
 CJK_FONT_CANDIDATES = [
     str(PROJECT_ROOT / 'fonts' / 'msyh.ttc'),   # 项目自带字体（随项目一起分发，跨机器渲染一致）
     r'C:\Windows\Fonts\msyh.ttc', r'C:\Windows\Fonts\msyh.ttf',
@@ -42,24 +36,6 @@ CJK_FONT_CANDIDATES = [
     '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
 ]
 _cjk_font = next((p for p in CJK_FONT_CANDIDATES if Path(p).exists()), None)
-_cjk_family = None
-if _cjk_font is not None:
-    try:
-        font_manager.fontManager.addfont(_cjk_font)
-        _cjk_family = font_manager.FontProperties(fname=_cjk_font).get_name()
-    except Exception:
-        _cjk_font = None
-if _cjk_family is not None:
-    # 最终校验：用 findfont 实际查一次，查得到才设置（彻底杜绝 not found 警告）
-    try:
-        font_manager.findfont(font_manager.FontProperties(family=_cjk_family),
-                              fallback_to_default=True)
-        plt.rcParams['font.family'] = [_cjk_family, 'sans-serif']
-    except Exception:
-        _cjk_family = None
-plt.rcParams['axes.unicode_minus'] = False
-if _cjk_family is None:
-    print('[提示] 未加载到中文字体，图表中文可能显示为方块；项目 fonts/ 目录存在时不会出现')
 
 def load_cjk_font(size: int):
     """PIL 用中文字体；找不到时回退默认字体。"""
@@ -70,14 +46,10 @@ def load_cjk_font(size: int):
             pass
     return ImageFont.load_default()
 
-from scratch_width_proto import (centerline_width, order_path, longest_path,
-                                 arc_sample, scanline_width, stats, fmt,
-                                 clean_mask_envelope, clean_mask_minimal)
-
 # ================= 可调参数（按实验条件调整） =================
 # 包络版闭运算结构元素直径（px）：决定"填平多宽的边缘细胞凹陷"。
 # 经验起点 41px；应随物镜倍率/图像分辨率标定（高倍率/高分辨率需增大）。
-ENVELOPE_KERNEL = 41
+ENVELOPE_KERNEL = 12
 
 # ---- 自动读取 Input 目录下所有图片 ----
 IMGS = sorted([p for p in IMG_DIR.iterdir()
@@ -127,7 +99,8 @@ def overlay_extract(rgb):
 
 # ---------------- 单图双口径处理 ----------------
 def process_image(idx, name, img, m, tag, label, out_dir):
-    """对一张掩膜做测宽对比 + 出图；tag 用于文件名后缀，label 用于打印/标题"""
+    """对一张掩膜做测宽统计，返回数据字典（不画图）。
+    tag 用于标识口径后缀，label 用于打印/标注。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     frac = m.mean()
     ys, xs = np.nonzero(m)
@@ -154,15 +127,16 @@ def process_image(idx, name, img, m, tag, label, out_dir):
     print(f'  [中轴中心线法]  有效测量区(剔除两端): {fmt(s_center)}')
     print(f'  [扫描线法]      {fmt(s_scan)}')
 
-    # ---- 出图 ----
+    # ---- 输出 2 张图（叠加图 + 山脊图；不做折线对比图）----
     mask8 = (m * 255).astype(np.uint8)
 
-    # 普通叠加图：伤口淡蓝色
+    # 叠加图：伤口淡蓝色
     color_plain = img.copy()
     color_plain[mask8 > 0] = (0, 200, 255)
     Image.fromarray(color_plain).save(os.path.join(out_dir, f'_real{idx}_mask{tag}.png'))
 
-    # 山脊版：绿=原始山脊(含毛刺)  红=清理后主干
+    # 山脊图：绿=原始山脊(含毛刺)  红=清理后主干
+    from skimage.morphology import medial_axis
     color = img.copy()
     color[mask8 > 0] = (0, 200, 255)
     raw_skel = medial_axis(m.astype(bool)).astype(np.uint8)
@@ -179,33 +153,17 @@ def process_image(idx, name, img, m, tag, label, out_dir):
                  stroke_width=2, stroke_fill=(0, 0, 0), font=font)
     pil_img.save(os.path.join(out_dir, f'_real{idx}_mask_ridge{tag}.png'))
 
-    # 宽度分布对比图
-    fig, ax = plt.subplots(figsize=(11, 4.5))
-    ax.plot(pos, ws, 'b-o', ms=3, lw=1, label='中轴中心线法（沿弧长）')
-    ax.axhline(s_center['mean'], color='b', ls='--', lw=1,
-               label=f"中轴均值(有效测量区) {s_center['mean']:.1f}")
-    # 两端剔除区间用浅色底标出
-    ax.axvspan(pos[0], pos[keep.argmax()], color='gray', alpha=0.15)
-    ax.axvspan(pos[-1 - keep[::-1].argmax()], pos[-1], color='gray', alpha=0.15)
-    xx = np.arange(len(sw_))
-    ok = ~np.isnan(sw_)
-    ax.plot(xx[ok], sw_[ok], 'r.', ms=2, alpha=0.5,
-            label='扫描线法（逐' + ('行' if vertical else '列') + '范围）')
-    ax.axhline(s_scan['mean'], color='r', ls='--', lw=1, label=f"扫描线均值 {s_scan['mean']:.1f}")
-    ax.set_xlabel('位置（像素）'); ax.set_ylabel('宽度（像素）')
-    ax.set_title(f'图{idx} 宽度对比（{label}）：中轴法 vs 扫描线法（{name[:20]}…）')
-    ax.legend(); ax.grid(alpha=0.3)
-    # 右下角说明：SD 与 CV
-    info = (f"中轴法(有效测量区): 均值 {s_center['mean']:.1f}  SD {s_center['sd']:.1f}  "
-            f"CV {s_center['cv']:.3f}\n"
-            f"扫描线法:            均值 {s_scan['mean']:.1f}  SD {s_scan['sd']:.1f}  "
-            f"CV {s_scan['cv']:.3f}")
-    ax.text(0.98, -0.06, info, transform=ax.transAxes, ha='right', va='top',
-            fontsize=10,
-            bbox=dict(boxstyle='round,pad=0.4', fc='#f5f8fb', ec='#b8c4d0'))
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f'_real{idx}_profile{tag}.png'), dpi=110)
-    plt.close()
+    # ---- 返回统计数据（供 txt 汇总）----
+    return {
+        'label': label,
+        'tag': tag,
+        'mask_frac': float(frac),
+        'vertical': vertical,
+        'hspan': int(hspan), 'wspan': int(wspan),
+        'center_all': s_center_all,
+        'center_eff': s_center,
+        'scanline': s_scan,
+    }
 
 
 def image_tag(name):
@@ -230,15 +188,42 @@ def main():
         raw = overlay_extract(img)
 
         # 包络版（41px 闭运算填平边缘凹陷）
-        print('--- [包络版] 类包络：闭运算41px填平边缘细胞凹陷 ---')
-        process_image(idx, name, img, clean_mask_envelope(raw, ENVELOPE_KERNEL), '', '包络版', out_dir)
+        print('--- [包络版] 类包络：闭运算填平边缘细胞凹陷 ---')
+        d_env = process_image(idx, name, img, clean_mask_envelope(raw, ENVELOPE_KERNEL), '', '包络版', out_dir)
 
         # 无包络版（保留真实边缘形态）
         print('--- [无包络版] 仅孔洞填充+最大连通域，保留真实边缘 ---')
-        process_image(idx, name, img, clean_mask_minimal(raw), '_nofill', '无包络版', out_dir)
+        d_min = process_image(idx, name, img, clean_mask_minimal(raw), '_nofill', '无包络版', out_dir)
 
-        print(f'已输出: {out_dir.name}/_real{idx}_mask.png / _real{idx}_mask_nofill.png / '
-              f'_real{idx}_profile.png / _real{idx}_profile_nofill.png')
+        # 汇总写入 result.txt（双口径并排对比）
+        txt_path = out_dir / 'result.txt'
+        with open(txt_path, 'w', encoding='utf-8') as fh:
+            fh.write(f'图片: {name}\n')
+            fh.write(f'尺寸: {img.shape[1]}x{img.shape[0]}\n')
+            fh.write(f'时间戳: {run_ts}\n')
+            fh.write(f'ENVELOPE_KERNEL: {ENVELOPE_KERNEL}\n\n')
+
+            # 总览
+            fh.write('===== 总览 =====\n')
+            fh.write(f'{"指标":<18}{"包络版":>28}{"无包络版":>28}\n')
+            fh.write(f'{"掩膜像素占比":<18}{d_env["mask_frac"]*100:>26.2f}%{d_min["mask_frac"]*100:>26.2f}%\n')
+            dir_env = ("竖直" if d_env["vertical"] else "水平") + f' 高{d_env["hspan"]} 宽{d_env["wspan"]}'
+            dir_min = ("竖直" if d_min["vertical"] else "水平") + f' 高{d_min["hspan"]} 宽{d_min["wspan"]}'
+            fh.write(f'{"方向":<18}{dir_env:>28}{dir_min:>28}\n\n')
+
+            # 三个方法 × 每项指标并排
+            methods = (('center_all', '中轴中心线法·全段'), ('center_eff', '中轴中心线法·有效测量区(剔除两端)'),
+                       ('scanline', '扫描线法'))
+            for key, title in methods:
+                fh.write(f'===== {title} =====\n')
+                fh.write(f'{"指标":<12}{"包络版":>22}{"无包络版":>22}\n')
+                env_s, min_s = d_env[key], d_min[key]
+                for metric, lab in (('n', 'n(点数)'), ('mean', '均值'), ('median', '中位'),
+                                    ('sd', '标准差SD'), ('cv', 'CV'), ('p10', 'P10'),
+                                    ('p90', 'P90'), ('mn', 'min'), ('mx', 'max')):
+                    fh.write(f'{lab:<12}{env_s[metric]:>22.4f}{min_s[metric]:>22.4f}\n')
+                fh.write('\n')
+        print(f'数据已写入: {txt_path}')
 
 
 if __name__ == '__main__':
