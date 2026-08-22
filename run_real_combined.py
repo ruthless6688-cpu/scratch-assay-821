@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""真实划痕图：双口径宽度测量（数据输出版，不画图）
+"""真实划痕图：宽度测量（原始版，数据输出版）
 
-对 Input/ 下每张图同时计算两种口径的宽度统计：
-  [包络版]   椭圆闭运算填平边缘细胞凹陷（类包络掩膜，kernel 见 ENVELOPE_KERNEL）
-  [无包络版] 仅方向性填充 + 孔洞填充 + 最大连通域（保留真实边缘形态）
+对 Input/ 下每张图计算原始版宽度统计：
+  [原始版] 仅方向性填充 + 孔洞填充 + 最大连通域（保留真实边缘形态）
+  （全局闭运算包络版已停用 2026-08-22；自适应半岛修正版暂停用 2026-08-22）
 
 输出：每张图一个子文件夹（图片标识_月日_时分），内含 result.txt
      （掩膜占比、方向、中轴法全段/有效区、扫描线法的宽度统计）
@@ -23,7 +23,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 from scratch_width_proto import (centerline_width, order_path, longest_path,
                                  arc_sample, scanline_width, stats, fmt,
-                                 clean_mask_envelope, clean_mask_minimal)
+                                 clean_mask_minimal)
 
 # ---- 中文字体：优先项目自带，其次跨平台候选探测（用于 PIL 叠加图标注）----
 CJK_FONT_CANDIDATES = [
@@ -47,9 +47,8 @@ def load_cjk_font(size: int):
     return ImageFont.load_default()
 
 # ================= 可调参数（按实验条件调整） =================
-# 包络版闭运算结构元素直径（px）：决定"填平多宽的边缘细胞凹陷"。
-# 经验起点 41px；应随物镜倍率/图像分辨率标定（高倍率/高分辨率需增大）。
-ENVELOPE_KERNEL = 12
+# [已停用] 全局闭运算包络核（2026-08-22 起不再使用）
+# ENVELOPE_KERNEL = 12
 
 # ---- 自动读取 Input 目录下所有图片 ----
 IMGS = sorted([p for p in IMG_DIR.iterdir()
@@ -97,10 +96,9 @@ def overlay_extract(rgb):
     return ((h >= 15) & (h <= 40) & (s >= 60) & (v >= 40)).astype(np.uint8)
 
 
-# ---------------- 单图双口径处理 ----------------
+# ---------------- 单图处理（原始版） ----------------
 def process_image(idx, name, img, m, tag, label, out_dir):
-    """对一张掩膜做测宽统计，返回数据字典（不画图）。
-    tag 用于标识口径后缀，label 用于打印/标注。"""
+    """对一张掩膜做测宽统计，返回数据字典。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     frac = m.mean()
     ys, xs = np.nonzero(m)
@@ -127,7 +125,7 @@ def process_image(idx, name, img, m, tag, label, out_dir):
     print(f'  [中轴中心线法]  有效测量区(剔除两端): {fmt(s_center)}')
     print(f'  [扫描线法]      {fmt(s_scan)}')
 
-    # ---- 输出 2 张图（叠加图 + 山脊图；不做折线对比图）----
+    # ---- 输出 2 张图（叠加图 + 山脊图）----
     mask8 = (m * 255).astype(np.uint8)
 
     # 叠加图：伤口淡蓝色
@@ -187,42 +185,31 @@ def main():
 
         raw = overlay_extract(img)
 
-        # 包络版（41px 闭运算填平边缘凹陷）
-        print('--- [包络版] 类包络：闭运算填平边缘细胞凹陷 ---')
-        d_env = process_image(idx, name, img, clean_mask_envelope(raw, ENVELOPE_KERNEL), '', '包络版', out_dir)
+        # 原始版（保留真实边缘形态）
+        print('--- [原始版] 仅孔洞填充+最大连通域，保留真实边缘 ---')
+        blue_mask = clean_mask_minimal(raw)
+        d_min = process_image(idx, name, img, blue_mask, '_nofill', '原始版', out_dir)
 
-        # 无包络版（保留真实边缘形态）
-        print('--- [无包络版] 仅孔洞填充+最大连通域，保留真实边缘 ---')
-        d_min = process_image(idx, name, img, clean_mask_minimal(raw), '_nofill', '无包络版', out_dir)
+        # [已停用] 自适应半岛修正版（2026-08-22）——front_line 方案暂不采用
+        # 修正逻辑集中在 scratch_width_proto.correct_peninsulas，需要时重新启用
+        d_cor = d_min   # 修正版暂等于原始版
 
-        # 汇总写入 result.txt（双口径并排对比）
+        # 汇总写入 result.txt（原始版）
         txt_path = out_dir / 'result.txt'
         with open(txt_path, 'w', encoding='utf-8') as fh:
             fh.write(f'图片: {name}\n')
             fh.write(f'尺寸: {img.shape[1]}x{img.shape[0]}\n')
-            fh.write(f'时间戳: {run_ts}\n')
-            fh.write(f'ENVELOPE_KERNEL: {ENVELOPE_KERNEL}\n\n')
-
-            # 总览
-            fh.write('===== 总览 =====\n')
-            fh.write(f'{"指标":<18}{"包络版":>28}{"无包络版":>28}\n')
-            fh.write(f'{"掩膜像素占比":<18}{d_env["mask_frac"]*100:>26.2f}%{d_min["mask_frac"]*100:>26.2f}%\n')
-            dir_env = ("竖直" if d_env["vertical"] else "水平") + f' 高{d_env["hspan"]} 宽{d_env["wspan"]}'
-            dir_min = ("竖直" if d_min["vertical"] else "水平") + f' 高{d_min["hspan"]} 宽{d_min["wspan"]}'
-            fh.write(f'{"方向":<18}{dir_env:>28}{dir_min:>28}\n\n')
-
-            # 三个方法 × 每项指标并排
-            methods = (('center_all', '中轴中心线法·全段'), ('center_eff', '中轴中心线法·有效测量区(剔除两端)'),
-                       ('scanline', '扫描线法'))
-            for key, title in methods:
-                fh.write(f'===== {title} =====\n')
-                fh.write(f'{"指标":<12}{"包络版":>22}{"无包络版":>22}\n')
-                env_s, min_s = d_env[key], d_min[key]
-                for metric, lab in (('n', 'n(点数)'), ('mean', '均值'), ('median', '中位'),
-                                    ('sd', '标准差SD'), ('cv', 'CV'), ('p10', 'P10'),
-                                    ('p90', 'P90'), ('mn', 'min'), ('mx', 'max')):
-                    fh.write(f'{lab:<12}{env_s[metric]:>22.4f}{min_s[metric]:>22.4f}\n')
-                fh.write('\n')
+            fh.write(f'时间戳: {run_ts}\n\n')
+            d = d_min
+            fh.write('===== 原始版 =====\n')
+            fh.write(f'掩膜像素占比: {d["mask_frac"]*100:.2f}%\n')
+            fh.write(f'方向: {"竖直" if d["vertical"] else "水平"} (高{d["hspan"]} 宽{d["wspan"]})\n\n')
+            for key, title in (('center_all', '中轴中心线法·全段'), ('center_eff', '中轴中心线法·有效测量区(剔除两端)'),
+                               ('scanline', '扫描线法')):
+                s = d[key]
+                fh.write(f'[{title}] n={s["n"]} 均值={s["mean"]:.2f} 中位={s["median"]:.2f} '
+                         f'SD={s["sd"]:.2f} CV={s["cv"]:.4f} P10={s["p10"]:.1f} P90={s["p90"]:.1f} '
+                         f'min={s["mn"]:.1f} max={s["mx"]:.1f}\n')
         print(f'数据已写入: {txt_path}')
 
 

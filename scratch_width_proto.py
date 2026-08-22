@@ -2,7 +2,9 @@
 """
 划痕分析算法库（纯函数，无 IO / 绘图 / 自测入口）
 模块一 掩膜清理：_largest_component / _directional_fill（方向性孔洞填充，解决端部挂边细胞团）
-                  / _finalize / clean_mask_envelope（包络版闭运算）/ clean_mask_minimal（无包络版）
+                  / _finalize / clean_mask_minimal（原始版，保留真实边缘）
+                  / 自适应半岛修正：estimate_stable_core / axis_profile / correct_peninsulas
+                  （全局闭运算 clean_mask_envelope 已停用，2026-08-22）
 模块二 宽度测量：欧氏距离变换 + 中轴中心线法 vs 等间距扫描线法
 输入：任意二值划痕掩膜（1=划痕/伤口，0=细胞）
 由 run_real_combined.py 以真实图像驱动调用。
@@ -137,29 +139,31 @@ def _finalize(mask):
     m = _largest_component(m).astype(np.uint8)
     return m
 
-
-def clean_mask_envelope(mask, kernel=41):
-    """包络版：椭圆闭运算填平边缘细胞凹陷 + 孔洞填充 + 最大连通域。
-    kernel 为闭运算结构元素直径（px），由调用方按物镜倍率标定传入。"""
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel, kernel))
-    m = cv2.morphologyEx((mask * 255).astype(np.uint8), cv2.MORPH_CLOSE, k)
-    return _finalize(m)
-
+# [已停用] 全局闭运算包络版（2026-08-22 起不再使用，保留历史对照）
+# 问题：固定核(41px)只看一个尺度，不知道细胞大小/划痕宽度/局部形态；
+# 由自适应半岛修正 correct_peninsulas() 取代。
+# def clean_mask_envelope(mask, kernel=41):
+#     """包络版：椭圆闭运算填平边缘细胞凹陷 + 孔洞填充 + 最大连通域。
+#     kernel 为闭运算结构元素直径（px），由调用方按物镜倍率标定传入。"""
+#     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel, kernel))
+#     m = cv2.morphologyEx((mask * 255).astype(np.uint8), cv2.MORPH_CLOSE, k)
+#     return _finalize(m)
 
 def clean_mask_minimal(mask):
     """无包络版：仅方向性填充 + 孔洞填充 + 最大连通域，不做任何闭运算/填平"""
     return _finalize(mask)
 
 
-# ---------------- 2. 预处理：闭运算 + 孔洞填充 ----------------
-def preprocess(mask, close_k=5):
-    k = np.ones((close_k, close_k), np.uint8)
-    m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-    m = ndimage.binary_fill_holes(m).astype(np.uint8)
-    return m
+# [已停用] 预处理：闭运算 + 孔洞填充（死代码，无任何调用，2026-08-22 注释）
+# 原功能被 clean_mask_minimal / _finalize 取代
+# def preprocess(mask, close_k=5):
+#     k = np.ones((close_k, close_k), np.uint8)
+#     m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+#     m = ndimage.binary_fill_holes(m).astype(np.uint8)
+#     return m
 
 
-# ---------------- 3. 欧氏距离变换 + 中轴中心线 ----------------
+# ---------------- 2. 欧氏距离变换 + 中轴中心线 ----------------
 def centerline_width(mask):
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)          # 距离场
     skel = medial_axis(mask.astype(bool)).astype(np.uint8)      # 中轴（scikit-image）
@@ -250,7 +254,6 @@ def longest_path(xs, ys):
     path.reverse()
     return np.array(path)
 
-
 def arc_sample(path, wmap, n=60):
     """沿路径等弧长采样；wmap: {(x,y): 宽度}，返回 (弧长位置, 采样宽度)"""
     if len(path) < 2:
@@ -266,7 +269,7 @@ def arc_sample(path, wmap, n=60):
     return pos, ws
 
 
-# ---------------- 4. 对比：等间距垂直扫描线法（每列纵向范围） ----------------
+# ---------------- 3. 对比：等间距垂直扫描线法（每列纵向范围） ----------------
 def scanline_width(mask):
     ys, xs = np.nonzero(mask)
     widths = np.full(mask.shape[1], np.nan)
@@ -277,7 +280,7 @@ def scanline_width(mask):
     return widths
 
 
-# ---------------- 5. 统计 ----------------
+# ---------------- 4. 统计 ----------------
 def stats(w):
     w = w[~np.isnan(w)]
     return dict(n=len(w), mean=float(w.mean()), median=float(np.median(w)),
@@ -292,3 +295,161 @@ def fmt(s):
             f"P90={s['p90']:.1f}  min={s['mn']:.1f}  max={s['mx']:.1f}")
 
 
+
+# ---------------- 5. 自适应半岛修正（基于 mask 轮廓前沿线的局部自适应包络） ----------------
+def correct_peninsulas(mask, smooth_win=15,
+                       depth_ratio=0.15, mad_coef=4.0, cell_frac=0.05,
+                       endpoint_frac=0.12):
+    """自适应半岛修正（front_line 方案）：用 front_line.extract_front_line
+    提取蓝色 mask 的左右切口前沿线，检测突入伤口的细胞团并选择性填充。
+
+    基线取"外沿分位包络"（右线 90 分位 / 左线 10 分位，窗口约 4% 弧长）：
+    半岛只会让前沿线向内偏移、不会进入外沿分位，因此包络不被半岛自身污染。
+
+    返回 dict: corrected / correction / stats
+    """
+    m = np.asarray(mask, dtype=bool)
+    # 用 front_line 提取左右前沿线
+    try:
+        from front_line import extract_front_line
+        left_pts, right_pts = extract_front_line(m)
+    except Exception:
+        left_pts = right_pts = np.empty((0, 2))
+    if len(left_pts) < 8 or len(right_pts) < 8:
+        return {'corrected': m, 'correction': np.zeros_like(m),
+                'stats': {'failed': True, 'correction_area_ratio': 0.0,
+                          'max_correction_depth': 0.0, 'corrected_section_ratio': 0.0,
+                          'review_flag': True, 'reason': 'front_line_failed'}}
+
+    # 全局主轴（轮廓 PCA）→ 宽度方向 v
+    main = _largest_component(m)
+    yy, xx = np.nonzero(main)
+    pxy = np.column_stack((xx.astype(np.float64), yy.astype(np.float64)))
+    center = pxy.mean(axis=0)
+    cov = np.cov(pxy - center, rowvar=False)
+    try:
+        vals, vecs = np.linalg.eigh(cov)
+        u = vecs[:, int(np.argmax(vals))]
+    except np.linalg.LinAlgError:
+        return {'corrected': m, 'correction': np.zeros_like(m),
+                'stats': {'failed': True, 'correction_area_ratio': 0.0,
+                          'max_correction_depth': 0.0, 'corrected_section_ratio': 0.0,
+                          'review_flag': True, 'reason': 'pca_failed'}}
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.array([-u[1], u[0]], dtype=np.float64)
+
+    # PCA 特征向量符号是任意的：强制约定"右线位于 n 较大的一侧"，
+    # 否则 intrude 极性随图翻转（真半岛全部漏检、反而检出端部锥度）。
+    if float(np.median((right_pts - center) @ v)) < float(np.median((left_pts - center) @ v)):
+        v = -v
+
+    def _side_deviation(pts, sign):
+        """一条前沿线：投影到 (s, n)，等弧长重采样(1px)后提取外沿分位包络。
+        sign=+1 右线(大 n 侧), -1 左线(小 n 侧)。"""
+        rel = pts - center
+        s = rel @ u
+        n = rel @ v
+        order = np.argsort(s)
+        s, n = s[order], n[order]
+        # 等弧长重采样到 1px，使后续窗口宽度/端点剔除都是像素单位
+        s_u = np.arange(s[0], s[-1] + 1e-6, 1.0)
+        n_u = np.interp(s_u, s, n)
+        pts_u = np.column_stack([np.interp(s_u, s, pts[order, 0]),
+                                 np.interp(s_u, s, pts[order, 1])])
+        # 外沿分位包络：窗宽约 4% 弧长并随线长自适应（限幅 41~151px）。
+        # 半岛向内偏移，不会进入外沿分位 → 包络不会被半岛自身污染。
+        win = int(np.clip(round(0.04 * (s_u[-1] - s_u[0])), 41, 151))
+        q = 90 if sign > 0 else 10
+        env = ndimage.percentile_filter(n_u, q, size=win, mode='nearest')
+        n_smooth = _local_median(env, smooth_win)
+        n_end = max(1, int(round(len(s_u) * endpoint_frac)))
+        # 突入：向伤口内部（中心线方向）偏移
+        # 右线（大 n 侧）：突入 = n_smooth - n（n 变小=向中心）
+        # 左线（小 n 侧）：突入 = n - n_smooth（n 变大=向中心）
+        if sign > 0:
+            intrude = np.maximum(0.0, n_smooth - n_u)
+        else:
+            intrude = np.maximum(0.0, n_u - n_smooth)
+        intrude[:n_end] = 0
+        intrude[len(s_u) - n_end:] = 0
+        return {'s': s_u, 'n': n_u, 'n_smooth': n_smooth, 'intrude': intrude,
+                'n_end': n_end, 'pts': pts_u}
+
+    L = _side_deviation(left_pts, -1)
+    R = _side_deviation(right_pts, +1)
+
+    # 阈值（自适应）
+    med_w = float(np.median(2.0 * cv2.distanceTransform((m * 255).astype(np.uint8), cv2.DIST_L2, 5)[m]))
+    cell_est = med_w * cell_frac
+    l_mad = np.median(np.abs(L['intrude'][L['n_end']:-L['n_end']])) if len(L['intrude']) > 2 * L['n_end'] else 0.0
+    r_mad = np.median(np.abs(R['intrude'][R['n_end']:-R['n_end']])) if len(R['intrude']) > 2 * R['n_end'] else 0.0
+    left_thr = max(cell_est, med_w * depth_ratio, l_mad * mad_coef)
+    right_thr = max(cell_est, med_w * depth_ratio, r_mad * mad_coef)
+
+    left_pen = L['intrude'] > left_thr
+    right_pen = R['intrude'] > right_thr
+
+    # 填充：沿局部法线从原始前沿点填到平滑位置，只填原本是细胞的像素
+    correction = np.zeros_like(m)
+    h, w = m.shape
+
+    def _fill(dev, pen, sign):
+        pts = dev['pts']
+        s_arr, n_arr = dev['s'], dev['n']
+        n_smooth = dev['n_smooth']
+        for i in np.nonzero(pen)[0]:
+            p0 = pts[i]
+            n0 = n_arr[i]
+            n1 = n_smooth[i]
+            lo, hi = min(n0, n1), max(n0, n1)
+            # 沿宽度方向 v 从 n0 扫到 n1（用全局 v 近似法线）
+            for k in np.arange(lo, hi + 1e-6, 1.0):
+                p = p0 + v * (k - n0)
+                xi, yi = int(round(p[0])), int(round(p[1]))
+                if 0 <= xi < w and 0 <= yi < h and not m[yi, xi]:
+                    correction[yi, xi] = 1
+
+    _fill(L, left_pen, -1)
+    _fill(R, right_pen, +1)
+
+    correction = (correction > 0) & (~m)
+
+    # [方案A] 形态学磨边：开运算去掉孤立毛刺 + 中值滤波平滑边界，
+    # 避免逐截面"一刀切"造成的突兀台阶。
+    if correction.any():
+        c8 = (correction * 255).astype(np.uint8)
+        c8 = cv2.morphologyEx(c8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        c8 = cv2.medianBlur(c8, 3)
+        correction = (c8 > 127) & (~m)
+
+    corrected = m | correction
+
+    area_ratio = float(correction.sum()) / max(float(m.sum()), 1.0)
+    depths = np.concatenate([L['intrude'][left_pen], R['intrude'][right_pen]])
+    max_depth = float(depths.max()) if depths.size else 0.0
+    n_pen = int(left_pen.sum()) + int(right_pen.sum())
+    section_ratio = n_pen / max(len(left_pen) + len(right_pen), 1)
+    review_flag = (area_ratio > 0.15) or (section_ratio > 0.4)
+
+    return {
+        'corrected': corrected,
+        'correction': correction,
+        'stats': {
+            'failed': False,
+            'correction_area_ratio': area_ratio,
+            'max_correction_depth': max_depth,
+            'corrected_section_ratio': section_ratio,
+            'peninsula_sections': n_pen,
+            'left_threshold': left_thr, 'right_threshold': right_thr,
+            'review_flag': review_flag,
+        },
+    }
+
+
+def _local_median(x, win=15):
+    """滑动中位数（鲁棒平滑），边界用 nearest 填充。"""
+    if win % 2 == 0:
+        win += 1
+    if win < 3 or len(x) < win:
+        return x.astype(np.float64)
+    return ndimage.median_filter(x.astype(np.float64), size=win, mode='nearest')
