@@ -1,0 +1,291 @@
+= 活细胞成像仪划痕实验（伤口愈合）算法概要设计文档
+:revnumber: 1.0
+:revdate: 2026-08-21
+:doctype: book
+:toc: left
+:toclevels: 3
+:sectnums:
+:algorithm: xxxx
+:stem: latexmath
+
+// todo: 增值矫正
+
+== 文档说明
+本文档为活细胞成像仪内置划痕（伤口愈合）实验分析算法概要设计，用于指导算法原型开发、工程实现、测试验证与上层软件模块集成。
+本算法基于传统图像特征实现划痕区域自动分割与时序动力学定量。
+
+== 概述
+===  业务背景
+体外划痕愈合实验是活细胞高内涵成像经典应用。
+在融合单层细胞表面机械划开空白划痕区域，时序连续采集图像，定量分析细胞向划痕区域迁移闭合能力，用于药物筛选、肿瘤侵袭、上皮损伤修复等生物学评价。
+
+本算法采用**{algorithm}**，实现自动化分析。
+
+===  设计目标
+* 功能目标：划痕区域左右细胞前沿提取、多维度指标计算、时序动力学曲线。
+* 性能目标：2448×2048图像CPU单帧处理耗时 ≤ 1s；时序分析。
+* 鲁棒性目标：输出质量标记位用于结果过滤。
+
+===  术语定义
+[cols="a,a"]
+|===
+|术语 |说明
+|划痕伤口区域 |划开后无细胞的空白条带，细胞迁移愈合的目标区域
+|Leading‑Edge前沿 |细胞单层与划痕空白的交界轮廓
+|愈合率 |划痕闭合面积占初始T0划痕面积百分比
+|前沿粗糙度 |前沿实际轮廓长度 / 首尾理想直线长度，表征边缘锯齿程度
+|帧间配准 |时序图像对齐至T0基准坐标系，消除载台机械漂移
+|增殖校正 |利用无划痕对照孔，扣除细胞增殖带来的虚假愈合贡献
+|quality |算法输出质量状态标记位
+|===
+
+== 总体架构设计
+===  算法流水线
+```
+时序图像输入（已经过预处理，图像分割）
+↓
+[边缘提取模块] findContours 轮廓提取 → 按中线拆分左、右前沿点集
+↓
+[特征量化模块] 面积、宽度统计、前沿粗糙度计算
+↓
+[时序动力学模块] 愈合率计算、增殖校正、迁移速率拟合
+↓
+结果输出：CSV 动力学报告
+```
+
+===  输入输出定义
+==== 输入
+1. 图像：单视野时序明场图像序列(BGR)
+2. 成像元数据：um_per_pixel像素物理尺寸、各帧时间戳
+3. 可选输入：无划痕对照孔时序汇合度数据，用于增殖校正
+
+==== 输出
+1. 时序动力学CSV数据表
+
+== 核心模块详细设计
+===  边缘提取与前沿拆分模块
+1. 对划痕二值mask执行 `findContours(RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)`；
+2. 选取最大面积闭合轮廓作为划痕外边界；
+3. 计算轮廓全部x坐标中位数作为划痕虚拟中线；
+4. 轮廓点按x坐标划分：
+    * x < mid_x → 左侧细胞前沿点集
+    * x > mid_x → 右侧细胞前沿点集
+5. 输出两组有序N×2坐标点数组。
+
+===  特征量化模块
+====  面积类指标
+* 划痕像素面积：`countNonZero(mask)`
+* 物理面积：`area_um2 = area_px * um_per_pixel^2`
+* 剩余伤口占比：`W_remain = A_t / A_0`
+* 原始愈合率：`Heal_raw = (A0‑At)/A0 *100%`
+
+====  划痕宽度指标
+沿图像Y轴等步长采样；同一Y同时存在左右前沿点，计算局部宽度：
+`width = rx − lx`
+
+输出统计：
+* 平均宽度px / um
+* 宽度标准差
+* 逐行宽度采样数组，用于评估划痕均匀度。
+
+====  前沿形态指标‑粗糙度
+* 实际轮廓长度：相邻轮廓点欧式距离累加
+* 理想直线长度：该条前沿首尾两点直线距离
+* 粗糙度 = 实际轮廓长度 / 理想直线长度
+> roughness=1代表完全笔直；数值越大前沿锯齿越严重。分别输出左、右前沿粗糙度。
+
+===  时序动力学计算模块
+====  动力学曲线
+以真实时间(h)为X轴，愈合率/剩余伤口占比为Y轴，生成时序曲线，支持多组对比。
+
+====  增殖校正
+输入无划痕对照孔时序汇合度，计算增殖倍数Fpro(t)。
+扣除细胞增殖带来的假愈合，输出校正后愈合率；原始愈合数据保留不覆盖。
+当对照数据异常，标记quality_flag，关闭校正。
+
+====  迁移速率拟合
+用户可指定拟合时间区间，线性回归，输出表观迁移速率 μm/h。
+
+===  质量控制模块
+quality 状态定义：
+[cols="a,a"]
+|===
+|值 |含义
+|0 |划痕分割结果可信
+|1 |划痕面积过小
+|2 |未检测划痕/分割置信度低，结果仅供参考
+|===
+
+// T0初始帧额外校验：划痕初始宽度变异系数、划痕周边细胞汇合度校验。
+
+== 接口与数据结构
+===  C++伪代码接口
+[source,cpp]
+----
+/**
+ * @brief 划痕实验单张图像分析接口
+ * 对输入明场/相差图像执行划痕分割、前沿提取与量化指标计算
+ * @param[in] image 输入图像指针，不能为NULL
+ * @param[in] parameter 输入分析参数指针，不能为NULL
+ * @param[out] result 输出分析结果，不能为NULL
+ * @param[out] invasionData 输出划痕区细胞侵入结果，可为NULL
+ * @return 划痕质量枚举 EScratchQuality
+ * @note 输入图像分割已完成；内部不做帧间配准，时序序列需上层完成配准后再逐帧调用
+ */
+enum EScratchQuality analyseScratch(
+    const cv::Mat* image, 
+    const struct ScratchParameter* parameter,
+    struct ScratchResult* result,
+    struct ScratchInvasionData* invasionData);
+
+/**
+ * @brief 划痕实验时序图像分析接口
+ * 对输入明场/相差图像执行划痕分割、前沿提取与量化指标计算
+ * @param[in] expImageList 输入实验组图像的数组指针，不能为NULL
+ * @param[in] conImageList 输入对照组图像的数组指针，可为NULL
+ * @param[in] timestamp 输入图像时间戳的数组指针，不能为NULL
+ * @param[in] size 输入图像的个数
+ * @param[in] parameter 输入分析参数指针，不能为NULL
+ * @param[out] result 输出分析结果，数组指针，不能为NULL
+ * @param[out] invasionData 输出划痕区细胞侵入结果，数组指针，可为NULL
+ * @return int 错误码，0代表处理成功；非0为异常错误码（图像为空、分割失败等）
+ * @note 如果传入conImageList则会进行增值校正计算
+ */
+int analyseScratchKinetic(
+    const cv::Mat* expImageList,
+    const cv::Mat* conImageList,
+    const uint64_t* timestamp,
+    size_t size,
+    const struct ScratchParameter* parameter,
+    struct ScratchResultKinetic* result,
+    struct ScratchInvasionData* invasionData);
+
+/**
+ * @brief 划痕质量枚举，标记单帧划痕分析结果可信程度
+ */
+enum EScratchQuality
+{
+    ScratchQualityNormal,   ///< 正常，划痕分割结果可信
+    ScratchQualitySmall,    ///< 划痕过小
+    ScratchQualityAbnormal  ///< 异常：未检测划痕/划痕面积过小/分割置信度低，结果仅供参考
+};
+
+/**
+ * @brief 划痕分析输入参数结构体
+ */
+struct ScratchParameter
+{
+    int fillHole;       ///< 是否填充内部孔洞
+    double umPerPixel;  ///< 像素物理尺寸
+};
+
+/**
+ * @brief 面积结构体
+ */
+struct ScratchArea
+{
+    double pixel;   ///< 像素面积，单位：像素²
+    double um;      ///< 物理面积，单位：μm²
+};
+
+/**
+ * @brief 细胞侵袭数据
+ */
+struct ScratchInvasionData
+{
+    struct ScratchArea area;    ///< 划痕ROI框内细胞面接
+    double ratio;               ///< 划痕框内细胞占比 [0‑1]；=cell_pixel / scratch_roi_total_pixel
+};
+
+/**
+ * @brief 划痕单帧分析输出结果结构体
+ */
+struct ScratchResult
+{
+    struct ScratchArea area;    ///< 划痕伤口区域面积
+
+    /**
+     * @brief 划痕宽度统计
+     */
+    struct
+    {
+        double avg;     ///< 划痕平均宽度，单位 μm
+        double std;     ///< 划痕宽度标准差，单位 μm，反映划痕宽窄均匀度
+    } width;
+
+    /**
+     * @brief 细胞迁移前沿粗糙度
+     * @note 数值1.0代表前沿平直；大于1代表前沿锯齿、突起越明显
+     */
+    struct
+    {
+        double left;    ///< 左侧细胞前沿粗糙度
+        double right;   ///< 右侧细胞前沿粗糙度
+    } roughness;
+};
+
+/**
+ * @brief 划痕时序分析输出结果结构体
+ */
+struct ScratchResultKinetic
+{
+    struct ScratchResult raw;   ///< 原始数据
+
+    /**
+     * @brief 伤口愈合百分比
+     * @note 范围0‑100(%)；基于T0初始划痕面积计算原始愈合率
+     */
+    struct {
+        double raw;             ///< 原始愈合率
+        double corrected;       ///< 校正后愈合率，只有传入实验组时序图才有效
+    } heal;
+
+    double speed;               ///< 前沿表观迁移速率，单位 μm/h
+    int quality;                ///< 质量校验
+};
+----
+
+== 性能精度指标
+[cols="a,a"]
+|===
+|指标项 |规格
+|===
+
+待定
+
+== 边界异常处理
+1. 载台剧烈漂移、细胞大量死亡脱落：分割连通域异常，输出告警；
+
+== 部署集成说明
+* 原型：Python+OpenCV；工程落地：C++ + OpenCV
+* 依赖：仅OpenCV基础模块，不依赖深度学习框架；复用平台公共图像配准模块
+
+== 核心数学公式
+原始愈合率：
+[latexmath]
+++++
+Heal_{raw}(t) = \frac{A_0-A_t}{A_0} \times 100\%
+++++
+
+校正后愈合率：
+[latexmath]
+++++
+Heal_{corrected}(t) = Heal_{raw}(t) - Propoertion_{proliferation}(t)
+++++
+
+前沿迁移速度(单位 μm/h)：
+[latexmath]
+++++
+v = \frac{W_0-W_t}{2\cdot t}
+++++
+
+前沿粗糙度：
+[latexmath]
+++++
+Roughness = \frac{L_{real}}{L_{ideal}}
+++++
+
+== 参考
+* ImageJ Wound‑healing plugin 算法原理
+* 细胞划痕愈合实验技术规范
+* 高内涵成像系统算法设计规范
